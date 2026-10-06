@@ -60,13 +60,106 @@ function onReady() {
   els.viewDiagnosisBtn.addEventListener("click", viewCurrentDiagnosis);
   els.resetBtn.addEventListener("click", () => {
     fillForm(defaults);
+    // The example button keeps its original semantics: it really does restore
+    // the sample form, so the persisted draft is discarded as well.
+    clearFormDraft();
     showToast("已恢复示例参数");
   });
 
   renderZones();
-  fillForm(defaults);
+  // Restore the edits present when the trial page was left (duration, ramp
+  // limit, per-zone constraints and locks) before the calibration coefficients
+  // arrive; only the coefficient fields are then overwritten.
+  if (!restoreFormDraft()) fillForm(defaults);
   applyCalibratedCoefficients();
   loadSnapshots();
+
+  // Persist every edit so a detour through the calibration page returns to
+  // the exact form the user was working on, whether or not it was ever solved.
+  // Delegated so lock inputs re-created on a duration change are covered too.
+  document.querySelector(".input-panel")
+    .addEventListener("input", (event) => {
+      if (event.target.matches("input")) saveFormDraft();
+    });
+  window.addEventListener("pagehide", saveFormDraft);
+}
+
+const FORM_DRAFT_KEY = "trialFormDraft";
+
+function saveFormDraft() {
+  try {
+    localStorage.setItem(FORM_DRAFT_KEY, JSON.stringify(readForm()));
+  } catch (error) {
+    // Storage unavailable: cross-page restore simply degrades gracefully.
+  }
+}
+
+function clearFormDraft() {
+  try {
+    localStorage.removeItem(FORM_DRAFT_KEY);
+  } catch (error) {
+    // Ignore: nothing else depends on the slot.
+  }
+}
+
+function isValidDraft(draft) {
+  if (!draft || typeof draft !== "object") return false;
+  if (!Number.isInteger(draft.duration) || draft.duration < 1 || draft.duration > 24) return false;
+  if (!Number.isInteger(draft.max_setpoint_change) ||
+      draft.max_setpoint_change < 0 || draft.max_setpoint_change > 300) return false;
+  if (!Array.isArray(draft.zones) || draft.zones.length !== 2) return false;
+  for (const zone of draft.zones) {
+    if (!zone || typeof zone !== "object") return false;
+    if (typeof zone.name !== "string") return false;
+    if (!Number.isInteger(zone.initial_temperature)) return false;
+    if (!Array.isArray(zone.coefficients) || zone.coefficients.length !== 2 ||
+        zone.coefficients.some((value) => typeof value !== "string")) return false;
+    for (const key of ["final_low", "final_high", "max_temperature",
+        "exposure_threshold", "min_exposure"]) {
+      if (typeof zone[key] !== "string") return false;
+    }
+  }
+  if (!draft.locked_minutes || typeof draft.locked_minutes !== "object") return false;
+  for (const [minute, value] of Object.entries(draft.locked_minutes)) {
+    if (!/^\d+$/.test(minute)) return false;
+    if (!Number.isInteger(value)) return false;
+  }
+  return true;
+}
+
+// Rehydrate the form from the draft saved when the page was last left.
+// Returns true when a valid draft was applied.
+function restoreFormDraft() {
+  let raw;
+  try {
+    raw = localStorage.getItem(FORM_DRAFT_KEY);
+  } catch (error) {
+    return false;
+  }
+  if (!raw) return false;
+  let draft;
+  try {
+    draft = JSON.parse(raw);
+  } catch (error) {
+    return false;
+  }
+  if (!isValidDraft(draft)) return false;
+  fillForm({
+    duration: draft.duration,
+    maxSetpointChange: draft.max_setpoint_change,
+    zones: draft.zones.map((zone) => ({
+      name: zone.name,
+      initial_temperature: zone.initial_temperature,
+      coefficients: zone.coefficients,
+      final_low: zone.final_low,
+      final_high: zone.final_high,
+      max_temperature: zone.max_temperature,
+      exposure_threshold: zone.exposure_threshold,
+      min_exposure: zone.min_exposure
+    })),
+    locks: draft.locked_minutes
+  });
+  return true;
 }
 
 // If the calibration page just sent us here, its coefficients are waiting in
@@ -88,13 +181,19 @@ function applyCalibratedCoefficients() {
     return;
   }
   if (!Array.isArray(coefficients) || coefficients.length !== 2) return;
+  let applied = false;
   document.querySelectorAll(".zone-card").forEach((card, zoneIndex) => {
     const pair = coefficients[zoneIndex];
     if (!Array.isArray(pair) || pair.length !== 2) return;
     card.querySelector('[data-field="coefficient-0"]').value = pair[0];
     card.querySelector('[data-field="coefficient-1"]').value = pair[1];
+    applied = true;
   });
-  showToast("已将校准系数填入表单（未改动任何旧快照或诊断）");
+  if (!applied) return;
+  // The only fields overwritten are the two coefficient pairs per zone;
+  // persist the resulting form so further page switches keep the same edits.
+  saveFormDraft();
+  showToast("已将校准系数填入表单（未改动任何旧快照或诊断，其余编辑保持离开时的值）");
 }
 
 function renderZones() {
@@ -186,6 +285,8 @@ function readForm() {
 
 async function solve() {
   const payload = readForm();
+  // Persist the (possibly clamped) submitted values alongside the draft.
+  saveFormDraft();
   // A new trial supersedes every in-flight snapshot action.
   const seq = ++selectionSeq;
   els.solveBtn.disabled = true;

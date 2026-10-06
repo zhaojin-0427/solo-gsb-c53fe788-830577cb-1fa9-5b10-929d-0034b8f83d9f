@@ -3,7 +3,13 @@ const els = {};
 const selected = new Map();
 // Monotonic token: only the newest calibration run may touch the result panel.
 let calibSeq = 0;
+// Per-snapshot token of the newest check action; a detail response carrying an
+// older token must never add the snapshot back after it was unchecked.
+const detailSeqById = new Map();
 let lastResult = null;
+// Canonical fingerprint of the readings lastResult was computed from. Apply
+// is allowed only while it still matches the current entries.
+let lastSignature = null;
 
 function onReady() {
   els.picker = document.getElementById("snapshotPicker");
@@ -61,21 +67,57 @@ function renderPicker(items) {
 
 async function toggleSnapshot(id, checked) {
   if (!checked) {
+    // Canceling invalidates the pending detail fetch and every old result:
+    // a late response must neither re-select this snapshot nor revive apply.
+    detailSeqById.set(id, (detailSeqById.get(id) || 0) + 1);
     selected.delete(id);
     syncEntryPanels();
+    invalidateResult();
     return;
   }
+  const detailSeq = (detailSeqById.get(id) || 0) + 1;
+  detailSeqById.set(id, detailSeq);
   try {
     const response = await fetch(`/api/snapshots/${id}`);
+    if (detailSeq !== detailSeqById.get(id) || !isSnapshotChecked(id)) return;
     if (!response.ok) throw new Error("快照载入失败或不存在");
     const detail = await response.json();
+    // Re-arbitrate after the body arrives too: the box may have been cleared
+    // while the response was still streaming.
+    if (detailSeq !== detailSeqById.get(id) || !isSnapshotChecked(id)) return;
     selected.set(id, detail);
     syncEntryPanels();
+    invalidateResult();
   } catch (error) {
+    if (detailSeq !== detailSeqById.get(id)) return;
     const box = els.picker.querySelector(`input[data-id="${id}"]`);
+    if (box && !box.checked) return;
     if (box) box.checked = false;
+    selected.delete(id);
+    syncEntryPanels();
     showToast(`快照 #${id} 载入失败：${error.message}`, true);
   }
+}
+
+function isSnapshotChecked(id) {
+  const box = els.picker.querySelector(`input[data-id="${id}"]`);
+  return !!box && box.checked;
+}
+
+// Any change of the inputs (selection or readings) voids a previously returned
+// result: the panel is hidden and the apply button stays disabled until a new
+// response for the current inputs arrives. An in-flight run is also token-
+// invalidated, so its late response cannot re-enable the button.
+function invalidateResult() {
+  calibSeq += 1;
+  lastResult = null;
+  lastSignature = null;
+  els.panel.hidden = true;
+  els.body.innerHTML = "";
+  els.applyBtn.disabled = true;
+  els.applyBtn.title = "";
+  els.calibrateBtn.disabled = false;
+  els.calibrateBtn.textContent = "开始校准";
 }
 
 function syncEntryPanels() {
@@ -123,7 +165,7 @@ function buildEntryPanel(detail) {
         </div>`).join("")}
     </div>`;
   card.querySelectorAll(".series-editor").forEach((editor) => {
-    editor.querySelector(".add-reading").addEventListener("click", () => addReadingRow(editor, duration));
+    editor.querySelector(".add-reading").addEventListener("click", () => addUserReadingRow(editor, duration));
     addReadingRow(editor, duration);
   });
   return card;
@@ -136,15 +178,32 @@ function addReadingRow(editor, duration) {
     <input class="r-minute" type="number" min="1" max="${duration}" step="1" placeholder="分钟 1～${duration}" />
     <input class="r-temp" type="text" inputmode="decimal" placeholder="温度 0～300 有限小数" />
     <button type="button" class="small secondary remove-reading" title="删除该读数">×</button>`;
-  row.querySelector(".remove-reading").addEventListener("click", () => row.remove());
+  row.querySelector(".remove-reading").addEventListener("click", () => {
+    row.remove();
+    invalidateResult();
+  });
+  // Typing a reading changes the future calibration request, so any result
+  // already shown stops belonging to the current inputs and must be voided.
+  row.querySelector(".r-minute").addEventListener("input", invalidateResult);
+  row.querySelector(".r-temp").addEventListener("input", invalidateResult);
   editor.querySelector(".reading-rows").appendChild(row);
+}
+
+// User-clicked "add a reading" row: beyond building the row, the new blank
+// input itself changes the request, so a previously returned result is voided.
+function addUserReadingRow(editor, duration) {
+  addReadingRow(editor, duration);
+  invalidateResult();
 }
 
 const TEMP_PATTERN = /^[+-]?(\d+(\.\d*)?|\.\d+)$/;
 
-function collectPayload() {
+// Gather the current entries; with ``silent`` no toasts are emitted (used for
+// re-validating a stored result against the live form before applying).
+function collectPayload(silent = false) {
+  const complain = silent ? () => {} : (message) => showToast(message, true);
   if (selected.size < 2) {
-    showToast("请至少选择两条已找到曲线的不同快照。", true);
+    complain("请至少选择两条已找到曲线的不同快照。");
     return null;
   }
   const snapshots = [];
@@ -181,7 +240,7 @@ function collectPayload() {
       zones.push({ series });
     });
     if (problem) {
-      showToast(problem, true);
+      complain(problem);
       return null;
     }
     snapshots.push({ snapshot_id: id, zones });
@@ -189,9 +248,33 @@ function collectPayload() {
   return { snapshots };
 }
 
+// Canonical fingerprint of the exact readings a calibration request was built
+// from, so a returned result can be proven to still describe the current
+// inputs (selection, minutes and measured temperatures) before being applied.
+function payloadSignature(payload) {
+  return JSON.stringify(
+    payload.snapshots
+      .map((snapshot) => [
+        snapshot.snapshot_id,
+        snapshot.zones.map((zone) =>
+          zone.series.map((series) =>
+            series
+              .map((reading) => [reading.minute, reading.temperature])
+              .sort((a, b) => a[0] - b[0] || (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0))
+          )
+        )
+      ])
+      .sort((a, b) => a[0] - b[0])
+  );
+}
+
 async function runCalibration() {
   const payload = collectPayload();
   if (!payload) return;
+  const signature = payloadSignature(payload);
+  // A fresh run supersedes any earlier one; invalidateResult() has already
+  // voided results as inputs changed, but a new run invalidates stragglers
+  // even when the inputs happened to be untouched.
   const seq = ++calibSeq;
   els.calibrateBtn.disabled = true;
   els.calibrateBtn.textContent = "校准中…";
@@ -201,15 +284,23 @@ async function runCalibration() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)
     });
-    const data = await response.json();
+    const data = await response.json().catch(() => null);
+    // A late response (input changed / deselected / another run started) is
+    // fully discarded: it must not restore the result, the button, or apply.
     if (seq !== calibSeq) return;
     if (!response.ok) {
-      showToast(formatErrors(data.detail), true);
+      // Failure with the current inputs: keep any previous result voided and
+      // never expose stale coefficients through the apply button.
+      invalidateResult();
+      showToast(formatErrors(data && data.detail), true);
       return;
     }
-    renderCalibration(data);
+    renderCalibration(data, signature);
   } catch (error) {
-    if (seq === calibSeq) showToast(`校准请求失败：${error.message}`, true);
+    if (seq === calibSeq) {
+      invalidateResult();
+      showToast(`校准请求失败：${error.message}`, true);
+    }
   } finally {
     if (seq === calibSeq) {
       els.calibrateBtn.disabled = false;
@@ -218,15 +309,37 @@ async function runCalibration() {
   }
 }
 
-function renderCalibration(data) {
+// The result belongs to the request only when the response names exactly the
+// snapshots currently selected and both zones report a single unique pair.
+function resultMatchesInputs(data, signature) {
+  if (lastSignature !== signature) return false;
+  const currentIds = [...selected.keys()].sort((a, b) => a - b);
+  const resultIds = [...(data.snapshot_ids || [])].sort((a, b) => a - b);
+  if (currentIds.length !== resultIds.length ||
+      currentIds.some((id, index) => id !== resultIds[index])) {
+    return false;
+  }
+  return (data.zones || []).length === 2 &&
+    data.zones.every((zone) => zone.status === "unique" &&
+      Array.isArray(zone.coefficients) && zone.coefficients.length === 2);
+}
+
+function renderCalibration(data, signature) {
   lastResult = data;
+  lastSignature = signature;
   els.panel.hidden = false;
   els.badge.textContent = data.identifiable ? "两区均可辨识" : "存在不可辨识温区";
   els.badge.className = `badge ${data.identifiable ? "optimal" : "no_solution"}`;
   els.meta.innerHTML = `校准耗时 ${data.elapsed_ms} ms<br>快照 ${data.snapshot_ids.map((id) => `#${id}`).join("、")}`;
   els.message.textContent = data.message;
-  els.applyBtn.disabled = !data.identifiable;
-  els.applyBtn.title = data.identifiable ? "" : "存在并列最优系数对，整次套用已禁用";
+  // Gating on resultMatchesInputs in addition to the server's identifiable
+  // flag ensures apply only fires when both coefficient pairs are unique AND
+  // the result still describes the live selection/readings.
+  const applicable = data.identifiable && resultMatchesInputs(data, signature);
+  els.applyBtn.disabled = !applicable;
+  els.applyBtn.title = applicable
+    ? ""
+    : (data.identifiable ? "输入已变化，请重新校准" : "存在并列最优系数对，整次套用已禁用");
   els.body.innerHTML = data.zones.map(renderZoneResult).join("");
   els.panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
@@ -298,6 +411,14 @@ function renderAssignment(assignment) {
 
 function applyToForm() {
   if (!lastResult || !lastResult.identifiable) return;
+  // Last defense against UI edge cases: re-collect the live entries and only
+  // hand the coefficients over when they still uniquely match them.
+  const payload = collectPayload(true);
+  if (!payload || !resultMatchesInputs(lastResult, payloadSignature(payload))) {
+    invalidateResult();
+    showToast("输入已变化，旧校准结果不能套用，请重新校准。", true);
+    return;
+  }
   const coefficients = lastResult.zones.map((zone) => zone.coefficients);
   localStorage.setItem("calibratedCoefficients", JSON.stringify(coefficients));
   location.href = "/";
