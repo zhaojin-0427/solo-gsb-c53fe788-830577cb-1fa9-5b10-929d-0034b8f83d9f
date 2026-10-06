@@ -1,9 +1,18 @@
 const els = {};
 // Snapshots chosen for calibration, keyed by snapshot id in selection order.
 const selected = new Map();
-// Monotonic token: only the newest calibration run may touch the result panel.
+// Monotonic token: only the newest calibration run (or an input
+// invalidation) may touch the result panel, the apply button and toasts.
 let calibSeq = 0;
+// Per-snapshot tokens for the asynchronous snapshot-detail fetch, so a
+// detail response arriving after an uncheck (or after a newer re-check)
+// can never enter the selection again.
+let detailSeq = 0;
+const detailTokens = new Map();
+// The latest successful calibration, together with the canonical signature
+// of exactly the input (selected snapshots + entered readings) it came from.
 let lastResult = null;
+let lastSignature = null;
 
 function onReady() {
   els.picker = document.getElementById("snapshotPicker");
@@ -20,7 +29,25 @@ function onReady() {
 
   els.calibrateBtn.addEventListener("click", runCalibration);
   els.applyBtn.addEventListener("click", applyToForm);
+  // Any keystroke in the reading rows invalidates the pending result
+  // immediately; row removals are handled in the remove handler.
+  els.entryPanels.addEventListener("input", invalidateResult);
   loadSnapshotPicker();
+}
+
+// Any input change (snapshot added/removed, reading added/removed/edited,
+// new run started) retires every in-flight calibration response and the
+// stored result: stale responses must never re-render the result, re-enable
+// the apply button or let old coefficients be applied.
+function invalidateResult() {
+  calibSeq++;
+  lastResult = null;
+  lastSignature = null;
+  els.calibrateBtn.disabled = false;
+  els.calibrateBtn.textContent = "开始校准";
+  els.applyBtn.disabled = true;
+  els.applyBtn.title = "输入已变化，请重新校准";
+  els.panel.hidden = true;
 }
 
 async function loadSnapshotPicker() {
@@ -60,18 +87,44 @@ function renderPicker(items) {
 }
 
 async function toggleSnapshot(id, checked) {
+  // Either direction of the checkbox is an input change: retire the stored
+  // result and every in-flight calibration before doing anything else, so a
+  // fill-back can never slip through while a detail fetch is still pending.
+  invalidateResult();
   if (!checked) {
+    // Cancel the pending detail token and drop any late response for this
+    // snapshot.
+    detailTokens.delete(id);
     selected.delete(id);
     syncEntryPanels();
     return;
   }
+  // Each check gets its own token; only the latest in-flight fetch for this
+  // snapshot may add it to the selection.
+  const token = ++detailSeq;
+  detailTokens.set(id, token);
   try {
     const response = await fetch(`/api/snapshots/${id}`);
     if (!response.ok) throw new Error("快照载入失败或不存在");
     const detail = await response.json();
+    // Arbitrate the late detail: it is stale when a newer check replaced it,
+    // when the box was meanwhile unchecked, or when it describes a snapshot
+    // that no longer has a usable curve.
+    if (detailTokens.get(id) !== token) return;
+    const box = els.picker.querySelector(`input[data-id="${id}"]`);
+    if (!box || !box.checked || selected.has(id)) return;
+    if (!detail || detail.snapshot_id !== id || !hasCurve(detail)) {
+      if (box) box.checked = false;
+      detailTokens.delete(id);
+      showToast(`快照 #${id} 没有可用的设定曲线，不能加入校准。`, true);
+      return;
+    }
+    detailTokens.delete(id);
     selected.set(id, detail);
     syncEntryPanels();
   } catch (error) {
+    if (detailTokens.get(id) !== token) return;
+    detailTokens.delete(id);
     const box = els.picker.querySelector(`input[data-id="${id}"]`);
     if (box) box.checked = false;
     showToast(`快照 #${id} 载入失败：${error.message}`, true);
@@ -136,15 +189,25 @@ function addReadingRow(editor, duration) {
     <input class="r-minute" type="number" min="1" max="${duration}" step="1" placeholder="分钟 1～${duration}" />
     <input class="r-temp" type="text" inputmode="decimal" placeholder="温度 0～300 有限小数" />
     <button type="button" class="small secondary remove-reading" title="删除该读数">×</button>`;
-  row.querySelector(".remove-reading").addEventListener("click", () => row.remove());
+  row.querySelector(".remove-reading").addEventListener("click", () => {
+    // Removing a filled row changes the calibration input; removing a
+    // still-empty row does not.
+    const minuteText = row.querySelector(".r-minute").value.trim();
+    const tempText = row.querySelector(".r-temp").value.trim();
+    row.remove();
+    if (minuteText !== "" || tempText !== "") invalidateResult();
+  });
   editor.querySelector(".reading-rows").appendChild(row);
 }
 
 const TEMP_PATTERN = /^[+-]?(\d+(\.\d*)?|\.\d+)$/;
 
-function collectPayload() {
+function collectPayload(options = {}) {
+  const report = options.silent
+    ? () => false
+    : (message) => showToast(message, true);
   if (selected.size < 2) {
-    showToast("请至少选择两条已找到曲线的不同快照。", true);
+    report("请至少选择两条已找到曲线的不同快照。");
     return null;
   }
   const snapshots = [];
@@ -176,23 +239,37 @@ function collectPayload() {
           }
           readings.push({ minute: Number(minuteText), temperature: tempText });
         });
+        readings.sort((a, b) => a.minute - b.minute);
         series.push(readings);
       });
       zones.push({ series });
     });
     if (problem) {
-      showToast(problem, true);
+      report(problem);
       return null;
     }
     snapshots.push({ snapshot_id: id, zones });
   }
+  snapshots.sort((a, b) => a.snapshot_id - b.snapshot_id);
   return { snapshots };
+}
+
+// Canonical signature of exactly the calibration input (selected snapshots
+// plus every entered reading). A stored result may be applied only while its
+// signature still equals the signature of the current inputs; any edit moves
+// the input out from under it.
+function currentSignature() {
+  const payload = collectPayload({ silent: true });
+  return payload ? JSON.stringify(payload) : null;
 }
 
 async function runCalibration() {
   const payload = collectPayload();
   if (!payload) return;
-  const seq = ++calibSeq;
+  // Starting a new run retires the previous result and every older in-flight
+  // response immediately.
+  invalidateResult();
+  const seq = calibSeq;
   els.calibrateBtn.disabled = true;
   els.calibrateBtn.textContent = "校准中…";
   try {
@@ -204,10 +281,12 @@ async function runCalibration() {
     const data = await response.json();
     if (seq !== calibSeq) return;
     if (!response.ok) {
+      // Failed / invalid / unidentifiable calibration: the old result was
+      // already discarded, so no old coefficients can be applied.
       showToast(formatErrors(data.detail), true);
       return;
     }
-    renderCalibration(data);
+    renderCalibration(data, JSON.stringify(payload));
   } catch (error) {
     if (seq === calibSeq) showToast(`校准请求失败：${error.message}`, true);
   } finally {
@@ -218,15 +297,21 @@ async function runCalibration() {
   }
 }
 
-function renderCalibration(data) {
+function renderCalibration(data, signature) {
   lastResult = data;
+  lastSignature = signature;
   els.panel.hidden = false;
   els.badge.textContent = data.identifiable ? "两区均可辨识" : "存在不可辨识温区";
   els.badge.className = `badge ${data.identifiable ? "optimal" : "no_solution"}`;
   els.meta.innerHTML = `校准耗时 ${data.elapsed_ms} ms<br>快照 ${data.snapshot_ids.map((id) => `#${id}`).join("、")}`;
   els.message.textContent = data.message;
-  els.applyBtn.disabled = !data.identifiable;
-  els.applyBtn.title = data.identifiable ? "" : "存在并列最优系数对，整次套用已禁用";
+  // Applying requires both zone pairs unique AND the stored result still
+  // belonging to the current inputs.
+  const applicable = !!data.identifiable && signature === currentSignature();
+  els.applyBtn.disabled = !applicable;
+  els.applyBtn.title = data.identifiable
+    ? (applicable ? "" : "输入已变化，请重新校准")
+    : "存在并列最优系数对，整次套用已禁用";
   els.body.innerHTML = data.zones.map(renderZoneResult).join("");
   els.panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
@@ -296,9 +381,30 @@ function renderAssignment(assignment) {
     </div>`;
 }
 
+const COEFFICIENT_PATTERN = /^(0\.\d{2}|1\.00)$/;
+
 function applyToForm() {
+  // Final arbitration at click time: both zone pairs unique, the response
+  // successful, and it must still describe the current selection/readings.
   if (!lastResult || !lastResult.identifiable) return;
+  const signature = currentSignature();
+  if (signature === null || signature !== lastSignature) {
+    els.applyBtn.disabled = true;
+    els.applyBtn.title = "输入已变化，请重新校准";
+    showToast("输入已变化，旧校准结果不能套用，请重新校准。", true);
+    return;
+  }
   const coefficients = lastResult.zones.map((zone) => zone.coefficients);
+  if (
+    coefficients.length !== 2 ||
+    coefficients.some((pair) =>
+      !Array.isArray(pair) ||
+      pair.length !== 2 ||
+      pair.some((value) => typeof value !== "string" || !COEFFICIENT_PATTERN.test(value)))
+  ) {
+    showToast("校准结果中的系数无法辨识，不能填回。", true);
+    return;
+  }
   localStorage.setItem("calibratedCoefficients", JSON.stringify(coefficients));
   location.href = "/";
 }
